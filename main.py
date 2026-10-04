@@ -6,6 +6,9 @@ import threading
 import os
 import sounddevice as sd
 import interception
+import win32event
+import win32api
+from winerror import ERROR_ALREADY_EXISTS
 from vosk import Model, KaldiRecognizer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -478,6 +481,7 @@ class App(QMainWindow):
         if self.voice_thread and self.voice_thread.is_alive():
             self.voice_thread.stop()
         self.overlay.close()
+        self.tray_icon.hide()
         QApplication.quit()
 
     def mousePressEvent(self, event):
@@ -632,9 +636,13 @@ class App(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
-    # Чтобы программа не закрылась окончательно, когда окно прячется в трей
-    app.setQuitOnLastWindowClosed(False)
+    # Создаем системный замок (Mutex). Если он уже существует - значит прога работает
+    mutex = win32event.CreateMutex(None, False, "AVC_SingleInstance_Mutex")
+    if win32api.GetLastError() == ERROR_ALREADY_EXISTS:
+        QMessageBox.warning(None, "Блокировка", "Программа уже запущена!\nПроверь системный трей (рядом с часами).")
+        sys.exit(0)
     
+    app.setQuitOnLastWindowClosed(False)
     window = App()
     window.show()
     sys.exit(app.exec())
