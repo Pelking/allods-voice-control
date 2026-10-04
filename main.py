@@ -3,23 +3,26 @@ import json
 import time
 import queue
 import threading
+import os
 import sounddevice as sd
 import interception
 from vosk import Model, KaldiRecognizer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QComboBox, QPushButton, QTableWidget, QTableWidgetItem,
-    QLineEdit, QHeaderView, QFrame
+    QLineEdit, QHeaderView, QFrame, QAbstractItemView, QSystemTrayIcon, 
+    QMenu, QStyle, QSizeGrip, QInputDialog, QMessageBox
 )
 from PySide6.QtCore import Qt, QPoint, Signal, QObject, QTimer
-from PySide6.QtGui import QKeySequence
+from PySide6.QtGui import QKeySequence, QAction
 
-CONFIG_FILE = "commands.json"
+PROFILES_FILE = "profiles.json"
 MODEL_PATH = "model"
 
 KEY_ALIASES = {
     "control": "ctrl", "ctrl": "ctrl", "shift": "shift", "alt": "alt",
-    "return": "enter", "enter": "enter", "esc": "escape", "escape": "escape", "space": "space"
+    "return": "enter", "enter": "enter", "esc": "escape", "escape": "escape", 
+    "space": "space", "-": "minus", "=": "equals"
 }
 
 SCANCODE_MAP = {
@@ -40,7 +43,6 @@ QT_KEY_MAP = {
 
 RU_TO_EN = str.maketrans("йцукенгшщзхъфывапролджэячсмитьбюё", "qwertyuiop[]asdfghjkl;'zxcvbnm,.`")
 
-# Блокиратор для защиты от отвала драйвера при рестартах потока
 INTERCEPTION_INITIALIZED = False
 
 
@@ -113,7 +115,6 @@ class VoiceThread(threading.Thread):
         
         global INTERCEPTION_INITIALIZED
         try:
-            # Инициализируем только если это первое нажатие СТАРТ за всю сессию
             if not INTERCEPTION_INITIALIZED:
                 interception.auto_capture_devices(keyboard=True, mouse=False)
                 INTERCEPTION_INITIALIZED = True
@@ -170,21 +171,21 @@ class VoiceThread(threading.Thread):
     def press_single_combo(self, combo_str):
         try:
             combo_str = combo_str.lower().translate(RU_TO_EN)
-            normalized = combo_str.replace("-", "+")
-            keys = [k.strip() for k in normalized.split("+") if k.strip()]
+            keys = [k.strip() for k in combo_str.split("+") if k.strip()]
             mapped_keys = [KEY_ALIASES.get(k, k) for k in keys]
 
             for k in mapped_keys:
                 interception.key_down(k)
                 time.sleep(0.02)
             
-            time.sleep(0.08)
+            time.sleep(0.15) 
             
             for k in reversed(mapped_keys):
                 interception.key_up(k)
                 time.sleep(0.02)
+                
         except Exception as err:
-            print(f"Ошибка аппаратного нажатия [{combo_str}]: {err}")
+            self.bridge.status_changed.emit(f"Сбой кнопки: {err}", "error")
 
     def stop(self):
         self.running = False
@@ -263,7 +264,8 @@ class App(QMainWindow):
         super().__init__()
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.resize(540, 680)
+        self.resize(600, 750)
+        self.setMinimumSize(450, 550)
 
         self.bridge = SignalBridge()
         self.bridge.phrase_detected.connect(self.on_phrase)
@@ -272,10 +274,13 @@ class App(QMainWindow):
         self.overlay = GameOverlay()
         self.drag_position = QPoint()
         self.voice_thread = None
-        self.commands = self.load_commands()
+        
+        self.profiles = self.load_profiles()
+        self.current_profile = list(self.profiles.keys())[0] if self.profiles else "Основной"
 
         self.apply_styles()
         self.init_ui()
+        self.init_tray()
 
     def apply_styles(self):
         self.setStyleSheet("""
@@ -286,7 +291,8 @@ class App(QMainWindow):
             QComboBox, QLineEdit { background-color: #222630; border: 1px solid #333842; border-radius: 6px; padding: 8px 12px; color: #FFFFFF; }
             QComboBox::drop-down { border: none; }
             QComboBox QAbstractItemView { background-color: #1A1D24; selection-background-color: #3B82F6; color: #FFFFFF; border: 1px solid #333842; }
-            QTableWidget { background-color: #1A1D24; border: 1px solid #282C34; border-radius: 8px; gridline-color: #222630; color: #FFFFFF; }
+            QTableWidget { background-color: #1A1D24; border: 1px solid #282C34; border-radius: 8px; gridline-color: #222630; color: #FFFFFF; outline: 0; }
+            QTableWidget::item:selected { background-color: rgba(59, 130, 246, 0.2); color: #FFFFFF; border: 1px solid #3B82F6; }
             QHeaderView::section { background-color: #15181E; color: #8E96A4; padding: 6px; border: none; font-weight: 600; }
             QPushButton { font-weight: 600; border-radius: 6px; padding: 8px 14px; background-color: #222630; border: 1px solid #333842; color: #CBD5E1; }
             QPushButton:hover { background-color: #2A2F3D; color: #FFFFFF; }
@@ -297,6 +303,7 @@ class App(QMainWindow):
             QPushButton.titleBtn { background: transparent; border: none; color: #94A3B8; font-size: 14px; border-radius: 4px; padding: 2px 8px; }
             QPushButton.titleBtn:hover { background-color: #282C34; color: white; }
             QPushButton.closeBtn:hover { background-color: #EF4444; color: white; }
+            QSizeGrip { width: 16px; height: 16px; margin: 2px; }
         """)
 
     def init_ui(self):
@@ -311,16 +318,21 @@ class App(QMainWindow):
         title_bar = QHBoxLayout()
         app_title = QLabel("🎙 Allods Voice Control")
         app_title.setStyleSheet("font-weight: 700; font-size: 13px; color: #CBD5E1;")
+        
+        warn_title = QLabel("⚠️ ЗАПУСКАЙТЕ ДО ИГРЫ")
+        warn_title.setStyleSheet("font-weight: bold; font-size: 11px; color: #F59E0B;")
+
         title_bar.addWidget(app_title)
+        title_bar.addWidget(warn_title)
         title_bar.addStretch()
 
         btn_min = QPushButton("🗕")
         btn_min.setProperty("class", "titleBtn")
-        btn_min.clicked.connect(self.showMinimized)
+        btn_min.clicked.connect(self.hide)
 
         btn_close = QPushButton("✕")
         btn_close.setProperty("class", "titleBtn closeBtn")
-        btn_close.clicked.connect(self.close)
+        btn_close.clicked.connect(self.hide)
 
         title_bar.addWidget(btn_min)
         title_bar.addWidget(btn_close)
@@ -331,17 +343,34 @@ class App(QMainWindow):
         mic_layout = QVBoxLayout(mic_card)
         mic_title = QLabel("ИСТОЧНИК ЗВУКА")
         mic_title.setProperty("class", "sectionTitle")
-        mic_layout.addWidget(mic_title)
-
         self.mic_combo = QComboBox()
         self.populate_mics()
+        mic_layout.addWidget(mic_title)
         mic_layout.addWidget(self.mic_combo)
         main_layout.addWidget(mic_card)
 
         table_card = QFrame()
         table_card.setProperty("class", "card")
         table_layout = QVBoxLayout(table_card)
-        table_title = QLabel("БИНДЫ И КОМАНДЫ")
+        
+        prof_layout = QHBoxLayout()
+        prof_layout.addWidget(QLabel("ПРОФИЛЬ:"), 0)
+        self.profile_combo = QComboBox()
+        self.profile_combo.addItems(self.profiles.keys())
+        self.profile_combo.setCurrentText(self.current_profile)
+        self.profile_combo.currentTextChanged.connect(self.on_profile_changed)
+        prof_layout.addWidget(self.profile_combo, 1)
+
+        btn_add_prof = QPushButton("+")
+        btn_add_prof.clicked.connect(self.add_profile)
+        btn_del_prof = QPushButton("-")
+        btn_del_prof.clicked.connect(self.del_profile)
+        
+        prof_layout.addWidget(btn_add_prof)
+        prof_layout.addWidget(btn_del_prof)
+        table_layout.addLayout(prof_layout)
+
+        table_title = QLabel("БИНДЫ (Кликните для редактирования)")
         table_title.setProperty("class", "sectionTitle")
         table_layout.addWidget(table_title)
 
@@ -349,6 +378,10 @@ class App(QMainWindow):
         self.table.setHorizontalHeaderLabels(["Слово / Фраза", "Клавиша"])
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.itemClicked.connect(self.on_table_item_clicked)
+        
         table_layout.addWidget(self.table)
         self.refresh_table()
 
@@ -358,7 +391,7 @@ class App(QMainWindow):
         
         self.input_key = KeyCaptureLineEdit()
 
-        btn_add = QPushButton("Добавить")
+        btn_add = QPushButton("Сохранить")
         btn_add.setProperty("class", "btnPrimary")
         btn_add.clicked.connect(self.add_command)
 
@@ -367,7 +400,7 @@ class App(QMainWindow):
         inputs_layout.addWidget(btn_add, 3)
         table_layout.addLayout(inputs_layout)
 
-        btn_del = QPushButton("Удалить выбранную строку")
+        btn_del = QPushButton("Удалить выбранную команду")
         btn_del.setProperty("class", "btnDanger")
         btn_del.clicked.connect(self.del_command)
         table_layout.addWidget(btn_del)
@@ -401,6 +434,52 @@ class App(QMainWindow):
         ctrl_layout.addWidget(self.log_label)
         main_layout.addWidget(ctrl_card)
 
+        # Ползунок для изменения размера в правом нижнем углу
+        size_grip_layout = QHBoxLayout()
+        size_grip_layout.addStretch()
+        self.size_grip = QSizeGrip(self)
+        size_grip_layout.addWidget(self.size_grip)
+        main_layout.addLayout(size_grip_layout)
+
+    def init_tray(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        # Стандартная иконка, чтобы трей не был пустым квадратом
+        self.tray_icon.setIcon(self.style().standardIcon(QStyle.SP_ComputerIcon))
+        
+        self.tray_menu = QMenu()
+        
+        self.action_toggle = QAction("Включить микрофон", self)
+        self.action_toggle.triggered.connect(self.toggle_listening)
+        self.tray_menu.addAction(self.action_toggle)
+        
+        self.tray_menu.addSeparator()
+        
+        self.action_show = QAction("Показать окно", self)
+        self.action_show.triggered.connect(self.show_window)
+        self.tray_menu.addAction(self.action_show)
+        
+        self.action_quit = QAction("Выход из программы", self)
+        self.action_quit.triggered.connect(self.quit_app)
+        self.tray_menu.addAction(self.action_quit)
+        
+        self.tray_icon.setContextMenu(self.tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_activated)
+        self.tray_icon.show()
+
+    def show_window(self):
+        self.showNormal()
+        self.activateWindow()
+
+    def on_tray_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.show_window()
+
+    def quit_app(self):
+        if self.voice_thread and self.voice_thread.is_alive():
+            self.voice_thread.stop()
+        self.overlay.close()
+        QApplication.quit()
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -423,31 +502,64 @@ class App(QMainWindow):
                     is_def = " (По умолчанию)" if idx == default_in else ""
                     self.mic_combo.addItem(f"{name}{is_def}", idx)
 
-    def load_commands(self):
+    def load_profiles(self):
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            with open(PROFILES_FILE, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
-            return {"стан": "e", "щит": "ctrl+f1"}
+            return {"Основной": {"стан": "e", "щит": "ctrl+f1"}}
 
-    def save_commands(self):
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(self.commands, f, ensure_ascii=False, indent=2)
+    def save_profiles(self):
+        with open(PROFILES_FILE, "w", encoding="utf-8") as f:
+            json.dump(self.profiles, f, ensure_ascii=False, indent=2)
+
+    def on_profile_changed(self, text):
+        if text and text in self.profiles:
+            self.current_profile = text
+            self.refresh_table()
+
+    def add_profile(self):
+        name, ok = QInputDialog.getText(self, "Новый профиль", "Название профиля:")
+        if ok and name:
+            if name not in self.profiles:
+                self.profiles[name] = {}
+                self.profile_combo.addItem(name)
+                self.profile_combo.setCurrentText(name)
+                self.save_profiles()
+
+    def del_profile(self):
+        if len(self.profiles) > 1:
+            name = self.current_profile
+            reply = QMessageBox.question(self, "Удаление", f"Удалить профиль '{name}'?", QMessageBox.Yes | QMessageBox.No)
+            if reply == QMessageBox.Yes:
+                del self.profiles[name]
+                self.profile_combo.removeItem(self.profile_combo.currentIndex())
+                self.save_profiles()
+        else:
+            QMessageBox.warning(self, "Ошибка", "Нельзя удалить последний профиль!")
 
     def refresh_table(self):
         self.table.setRowCount(0)
-        for row, (w, k) in enumerate(self.commands.items()):
+        commands = self.profiles.get(self.current_profile, {})
+        for row, (w, k) in enumerate(commands.items()):
             self.table.insertRow(row)
             self.table.setItem(row, 0, QTableWidgetItem(w))
             self.table.setItem(row, 1, QTableWidgetItem(k))
+
+    def on_table_item_clicked(self, item):
+        row = item.row()
+        word = self.table.item(row, 0).text()
+        key = self.table.item(row, 1).text()
+        self.input_word.setText(word)
+        self.input_key.setText(key)
 
     def add_command(self):
         w = self.input_word.text().strip().lower()
         k = self.input_key.text().strip().lower()
         if not w or not k:
             return
-        self.commands[w] = k
-        self.save_commands()
+        self.profiles[self.current_profile][w] = k
+        self.save_profiles()
         self.refresh_table()
         self.input_word.clear()
         self.input_key.clear()
@@ -456,10 +568,12 @@ class App(QMainWindow):
         curr = self.table.currentRow()
         if curr >= 0:
             w = self.table.item(curr, 0).text()
-            if w in self.commands:
-                del self.commands[w]
-                self.save_commands()
+            if w in self.profiles[self.current_profile]:
+                del self.profiles[self.current_profile][w]
+                self.save_profiles()
                 self.refresh_table()
+                self.input_word.clear()
+                self.input_key.clear()
 
     def toggle_listening(self):
         if self.voice_thread and self.voice_thread.is_alive():
@@ -470,15 +584,22 @@ class App(QMainWindow):
                 QPushButton:hover { background-color: #059669; }
             """)
             self.on_status("Остановлено", "idle")
+            self.action_toggle.setText("Включить микрофон")
+            self.profile_combo.setEnabled(True)
         else:
             dev_idx = self.mic_combo.currentData()
-            self.voice_thread = VoiceThread(dev_idx, self.commands, self.bridge)
+            active_commands = self.profiles[self.current_profile]
+            
+            self.voice_thread = VoiceThread(dev_idx, active_commands, self.bridge)
             self.voice_thread.start()
+            
             self.btn_toggle.setText("ОСТАНОВИТЬ")
             self.btn_toggle.setStyleSheet("""
                 QPushButton { background-color: #EF4444; color: white; font-size: 14px; font-weight: 700; border: none; border-radius: 8px; }
                 QPushButton:hover { background-color: #DC2626; }
             """)
+            self.action_toggle.setText("Выключить микрофон")
+            self.profile_combo.setEnabled(False) # Блокируем смену профиля во время работы
 
     def on_phrase(self, phrase, key):
         self.log_label.setText(f"Последнее действие: Сказано «{phrase}» ➔ нажато [{key}]")
@@ -497,14 +618,23 @@ class App(QMainWindow):
             self.status_text.setStyleSheet("color: #94A3B8; font-weight: 600;")
 
     def closeEvent(self, event):
-        if self.voice_thread and self.voice_thread.is_alive():
-            self.voice_thread.stop()
-        self.overlay.close()
-        event.accept()
+        # Вместо закрытия сворачиваем в трей
+        event.ignore()
+        self.hide()
+        self.tray_icon.showMessage(
+            "Allods Voice Control", 
+            "Программа работает в фоновом режиме", 
+            QSystemTrayIcon.Information, 
+            2000
+        )
 
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    
+    # Чтобы программа не закрылась окончательно, когда окно прячется в трей
+    app.setQuitOnLastWindowClosed(False)
+    
     window = App()
     window.show()
     sys.exit(app.exec())
