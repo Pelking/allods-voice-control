@@ -40,6 +40,15 @@ QT_KEY_MAP = {
 
 RU_TO_EN = str.maketrans("йцукенгшщзхъфывапролджэячсмитьбюё", "qwertyuiop[]asdfghjkl;'zxcvbnm,.`")
 
+# --- ГЛОБАЛЬНАЯ ИНИЦИАЛИЗАЦИЯ ДРАЙВЕРА (СТРОГО ОДИН РАЗ) ---
+INTERCEPTION_READY = False
+try:
+    interception.auto_capture_devices(keyboard=True, mouse=False)
+    INTERCEPTION_READY = True
+except Exception as e:
+    print(f"Ошибка инициализации Interception: {e}")
+
+
 class SignalBridge(QObject):
     phrase_detected = Signal(str, str)
     status_changed = Signal(str, str)
@@ -105,20 +114,12 @@ class VoiceThread(threading.Thread):
         self.bridge = bridge
         self.running = True
         self.audio_queue = queue.Queue()
-        self.interception_ready = False
-        
-        try:
-            # Захват первого доступного устройства ввода для эмуляции
-            interception.auto_capture_devices(keyboard=True, mouse=False)
-            self.interception_ready = True
-        except Exception as e:
-            print(f"Ошибка Interception: {e}")
 
     def callback(self, indata, frames, time_info, status):
         self.audio_queue.put(bytes(indata))
 
     def run(self):
-        if not self.interception_ready:
+        if not INTERCEPTION_READY:
             self.bridge.status_changed.emit("Драйвер Interception не установлен!", "error")
             return
 
@@ -302,7 +303,7 @@ class App(QMainWindow):
         main_layout.setSpacing(12)
 
         title_bar = QHBoxLayout()
-        app_title = QLabel("🎙️️ Allods Voice Control")
+        app_title = QLabel("🎙 Allods Voice Control")
         app_title.setStyleSheet("font-weight: 700; font-size: 13px; color: #CBD5E1;")
         title_bar.addWidget(app_title)
         title_bar.addStretch()
