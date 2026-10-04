@@ -40,13 +40,8 @@ QT_KEY_MAP = {
 
 RU_TO_EN = str.maketrans("йцукенгшщзхъфывапролджэячсмитьбюё", "qwertyuiop[]asdfghjkl;'zxcvbnm,.`")
 
-# --- ГЛОБАЛЬНАЯ ИНИЦИАЛИЗАЦИЯ ДРАЙВЕРА (СТРОГО ОДИН РАЗ) ---
-INTERCEPTION_READY = False
-try:
-    interception.auto_capture_devices(keyboard=True, mouse=False)
-    INTERCEPTION_READY = True
-except Exception as e:
-    print(f"Ошибка инициализации Interception: {e}")
+# Блокиратор для защиты от отвала драйвера при рестартах потока
+INTERCEPTION_INITIALIZED = False
 
 
 class SignalBridge(QObject):
@@ -114,13 +109,24 @@ class VoiceThread(threading.Thread):
         self.bridge = bridge
         self.running = True
         self.audio_queue = queue.Queue()
+        self.interception_ready = False
+        
+        global INTERCEPTION_INITIALIZED
+        try:
+            # Инициализируем только если это первое нажатие СТАРТ за всю сессию
+            if not INTERCEPTION_INITIALIZED:
+                interception.auto_capture_devices(keyboard=True, mouse=False)
+                INTERCEPTION_INITIALIZED = True
+            self.interception_ready = True
+        except Exception as e:
+            print(f"Ошибка Interception: {e}")
 
     def callback(self, indata, frames, time_info, status):
         self.audio_queue.put(bytes(indata))
 
     def run(self):
-        if not INTERCEPTION_READY:
-            self.bridge.status_changed.emit("Драйвер Interception не установлен!", "error")
+        if not self.interception_ready:
+            self.bridge.status_changed.emit("Ошибка драйвера Interception!", "error")
             return
 
         try:
