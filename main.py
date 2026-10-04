@@ -4,7 +4,7 @@ import time
 import queue
 import threading
 import sounddevice as sd
-import pydirectinput
+import interception
 from vosk import Model, KaldiRecognizer
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -17,14 +17,11 @@ from PySide6.QtGui import QKeySequence
 CONFIG_FILE = "commands.json"
 MODEL_PATH = "model"
 
-pydirectinput.PAUSE = 0.02
-
 KEY_ALIASES = {
     "control": "ctrl", "ctrl": "ctrl", "shift": "shift", "alt": "alt",
     "return": "enter", "enter": "enter", "esc": "escape", "escape": "escape", "space": "space"
 }
 
-# Аппаратные скан-коды физической клавиатуры (отвязка от языковой раскладки Windows)
 SCANCODE_MAP = {
     16: 'q', 17: 'w', 18: 'e', 19: 'r', 20: 't', 21: 'y', 22: 'u', 23: 'i', 24: 'o', 25: 'p', 26: '[', 27: ']',
     30: 'a', 31: 's', 32: 'd', 33: 'f', 34: 'g', 35: 'h', 36: 'j', 37: 'k', 38: 'l', 39: ';', 40: "'", 41: '`',
@@ -41,9 +38,7 @@ QT_KEY_MAP = {
     Qt.Key_F9: "f9", Qt.Key_F10: "f10", Qt.Key_F11: "f11", Qt.Key_F12: "f12",
 }
 
-# Подстраховка: перевод русских букв в английские, если они уже есть в commands.json
 RU_TO_EN = str.maketrans("йцукенгшщзхъфывапролджэячсмитьбюё", "qwertyuiop[]asdfghjkl;'zxcvbnm,.`")
-
 
 class SignalBridge(QObject):
     phrase_detected = Signal(str, str)
@@ -110,11 +105,23 @@ class VoiceThread(threading.Thread):
         self.bridge = bridge
         self.running = True
         self.audio_queue = queue.Queue()
+        self.interception_ready = False
+        
+        try:
+            # Захват первого доступного устройства ввода для эмуляции
+            interception.auto_capture_devices(keyboard=True, mouse=False)
+            self.interception_ready = True
+        except Exception as e:
+            print(f"Ошибка Interception: {e}")
 
     def callback(self, indata, frames, time_info, status):
         self.audio_queue.put(bytes(indata))
 
     def run(self):
+        if not self.interception_ready:
+            self.bridge.status_changed.emit("Драйвер Interception не установлен!", "error")
+            return
+
         try:
             model = Model(MODEL_PATH)
         except Exception:
@@ -155,23 +162,22 @@ class VoiceThread(threading.Thread):
 
     def press_single_combo(self, combo_str):
         try:
-            # Страховка: конвертируем в нижний регистр и меняем русские буквы на английские
             combo_str = combo_str.lower().translate(RU_TO_EN)
             normalized = combo_str.replace("-", "+")
             keys = [k.strip() for k in normalized.split("+") if k.strip()]
             mapped_keys = [KEY_ALIASES.get(k, k) for k in keys]
 
             for k in mapped_keys:
-                pydirectinput.keyDown(k)
+                interception.key_down(k)
                 time.sleep(0.02)
             
-            time.sleep(0.06)
+            time.sleep(0.08)
             
             for k in reversed(mapped_keys):
-                pydirectinput.keyUp(k)
+                interception.key_up(k)
                 time.sleep(0.02)
         except Exception as err:
-            print(f"Ошибка нажатия [{combo_str}]: {err}")
+            print(f"Ошибка аппаратного нажатия [{combo_str}]: {err}")
 
     def stop(self):
         self.running = False
@@ -226,7 +232,6 @@ class KeyCaptureLineEdit(QLineEdit):
         if modifiers & Qt.ShiftModifier:
             parts.append("shift")
 
-        # Читаем физический скан-код кнопки (независимо от языка)
         scan_code = event.nativeScanCode()
 
         if scan_code in SCANCODE_MAP:
@@ -297,7 +302,7 @@ class App(QMainWindow):
         main_layout.setSpacing(12)
 
         title_bar = QHBoxLayout()
-        app_title = QLabel("🎙️ Allods Voice Control")
+        app_title = QLabel("🎙️️ Allods Voice Control")
         app_title.setStyleSheet("font-weight: 700; font-size: 13px; color: #CBD5E1;")
         title_bar.addWidget(app_title)
         title_bar.addStretch()
